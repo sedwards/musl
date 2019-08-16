@@ -376,3 +376,222 @@ weak_alias(aio_fsync, aio_fsync64);
 weak_alias(aio_read, aio_read64);
 weak_alias(aio_write, aio_write64);
 weak_alias(aio_return, aio_return64);
+#include <aio.h>
+#include <errno.h>
+#include <time.h>
+#include "atomic.h"
+#include "pthread_impl.h"
+
+int aio_suspend(const struct aiocb *const cbs[], int cnt, const struct timespec *ts)
+{
+	int i, tid = 0, ret, expect = 0;
+	struct timespec at;
+	volatile int dummy_fut, *pfut;
+	int nzcnt = 0;
+	const struct aiocb *cb = 0;
+
+	pthread_testcancel();
+
+	if (cnt<0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	for (i=0; i<cnt; i++) if (cbs[i]) {
+		if (aio_error(cbs[i]) != EINPROGRESS) return 0;
+		nzcnt++;
+		cb = cbs[i];
+	}
+
+	if (ts) {
+		clock_gettime(CLOCK_MONOTONIC, &at);
+		at.tv_sec += ts->tv_sec;
+		if ((at.tv_nsec += ts->tv_nsec) >= 1000000000) {
+			at.tv_nsec -= 1000000000;
+			at.tv_sec++;
+		}
+	}
+
+	for (;;) {
+		for (i=0; i<cnt; i++)
+			if (cbs[i] && aio_error(cbs[i]) != EINPROGRESS)
+				return 0;
+
+		switch (nzcnt) {
+		case 0:
+			pfut = &dummy_fut;
+			break;
+		case 1:
+			pfut = (void *)&cb->__err;
+			expect = EINPROGRESS | 0x80000000;
+			a_cas(pfut, EINPROGRESS, expect);
+			break;
+		default:
+			pfut = &__aio_fut;
+			if (!tid) tid = __pthread_self()->tid;
+			expect = a_cas(pfut, 0, tid);
+			if (!expect) expect = tid;
+			/* Need to recheck the predicate before waiting. */
+			for (i=0; i<cnt; i++)
+				if (cbs[i] && aio_error(cbs[i]) != EINPROGRESS)
+					return 0;
+			break;
+		}
+
+		ret = __timedwait_cp(pfut, expect, CLOCK_MONOTONIC, ts?&at:0, 1);
+
+		switch (ret) {
+		case ETIMEDOUT:
+			ret = EAGAIN;
+		case ECANCELED:
+		case EINTR:
+			errno = ret;
+			return -1;
+		}
+	}
+}
+
+weak_alias(aio_suspend, aio_suspend64);
+#include <aio.h>
+#include <errno.h>
+#include <unistd.h>
+#include <string.h>
+#include "pthread_impl.h"
+
+struct lio_state {
+	struct sigevent *sev;
+	int cnt;
+	struct aiocb *cbs[];
+};
+
+static int lio_wait(struct lio_state *st)
+{
+	int i, err, got_err = 0;
+	int cnt = st->cnt;
+	struct aiocb **cbs = st->cbs;
+
+	for (;;) {
+		for (i=0; i<cnt; i++) {
+			if (!cbs[i]) continue;
+			err = aio_error(cbs[i]);
+			if (err==EINPROGRESS)
+				break;
+			if (err) got_err=1;
+			cbs[i] = 0;
+		}
+		if (i==cnt) {
+			if (got_err) {
+				errno = EIO;
+				return -1;
+			}
+			return 0;
+		}
+		if (aio_suspend((void *)cbs, cnt, 0))
+			return -1;
+	}
+}
+
+static void notify_signal(struct sigevent *sev)
+{
+	siginfo_t si = {
+		.si_signo = sev->sigev_signo,
+		.si_value = sev->sigev_value,
+		.si_code = SI_ASYNCIO,
+		.si_pid = getpid(),
+		.si_uid = getuid()
+	};
+	__syscall(SYS_rt_sigqueueinfo, si.si_pid, si.si_signo, &si);
+}
+
+static void *wait_thread(void *p)
+{
+	struct lio_state *st = p;
+	struct sigevent *sev = st->sev;
+	lio_wait(st);
+	free(st);
+	switch (sev->sigev_notify) {
+	case SIGEV_SIGNAL:
+		notify_signal(sev);
+		break;
+	case SIGEV_THREAD:
+		sev->sigev_notify_function(sev->sigev_value);
+		break;
+	}
+	return 0;
+}
+
+int lio_listio(int mode, struct aiocb *restrict const *restrict cbs, int cnt, struct sigevent *restrict sev)
+{
+	int i, ret;
+	struct lio_state *st=0;
+
+	if (cnt < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (mode == LIO_WAIT || (sev && sev->sigev_notify != SIGEV_NONE)) {
+		if (!(st = malloc(sizeof *st + cnt*sizeof *cbs))) {
+			errno = EAGAIN;
+			return -1;
+		}
+		st->cnt = cnt;
+		st->sev = sev;
+		memcpy(st->cbs, (void*) cbs, cnt*sizeof *cbs);
+	}
+
+	for (i=0; i<cnt; i++) {
+		if (!cbs[i]) continue;
+		switch (cbs[i]->aio_lio_opcode) {
+		case LIO_READ:
+			ret = aio_read(cbs[i]);
+			break;
+		case LIO_WRITE:
+			ret = aio_write(cbs[i]);
+			break;
+		default:
+			continue;
+		}
+		if (ret) {
+			free(st);
+			errno = EAGAIN;
+			return -1;
+		}
+	}
+
+	if (mode == LIO_WAIT) {
+		ret = lio_wait(st);
+		free(st);
+		return ret;
+	}
+
+	if (st) {
+		pthread_attr_t a;
+		sigset_t set;
+		pthread_t td;
+
+		if (sev->sigev_notify == SIGEV_THREAD) {
+			if (sev->sigev_notify_attributes)
+				a = *sev->sigev_notify_attributes;
+			else
+				pthread_attr_init(&a);
+		} else {
+			pthread_attr_init(&a);
+			pthread_attr_setstacksize(&a, PAGE_SIZE);
+			pthread_attr_setguardsize(&a, 0);
+		}
+		pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+		sigfillset(&set);
+		pthread_sigmask(SIG_BLOCK, &set, &set);
+		if (pthread_create(&td, &a, wait_thread, st)) {
+			free(st);
+			errno = EAGAIN;
+			return -1;
+		}
+		pthread_sigmask(SIG_SETMASK, &set, 0);
+	}
+
+	return 0;
+}
+
+weak_alias(lio_listio, lio_listio64);

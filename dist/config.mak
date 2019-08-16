@@ -3,7 +3,7 @@
 #
 
 # Target CPU architecture. Supported values: i386, x86_64
-ARCH = i386
+ARCH=arm
 
 # Installation prefix. DO NOT use /, /usr, or /usr/local !
 prefix = /usr/local/musl

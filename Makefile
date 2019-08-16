@@ -162,9 +162,10 @@ lib/libc.so: $(LOBJS) $(LDSO_OBJS)
 
 lib/libc.a: $(AOBJS)
 	rm -f $@
-	$(AR) rc $@ $(AOBJS)
+	find . -name *.lo | $(AR) rc $@
 	$(RANLIB) $@
 
+	#$(AR) rc $@ $(AOBJS)
 $(EMPTY_LIBS):
 	rm -f $@
 	$(AR) rc $@
